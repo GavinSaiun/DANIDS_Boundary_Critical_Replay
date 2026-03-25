@@ -20,9 +20,9 @@ from src.models.mlp import MLP
 # =========================
 RANDOM_STATE = 42
 BATCH_SIZE = 1024
-LEARNING_RATE = 1e-3
+LEARNING_RATE = 5e-4
 WEIGHT_DECAY = 1e-4
-NUM_EPOCHS = 15
+NUM_EPOCHS = 12
 PATIENCE = 4
 
 LABEL_COL = "Label"
@@ -56,16 +56,12 @@ def get_feature_cols(df: pd.DataFrame) -> list[str]:
     return [c for c in df.columns if c not in [LABEL_COL, ATTACK_COL]]
 
 
-def fit_standardizer(train_df: pd.DataFrame, feature_cols: list[str]) -> Tuple[pd.Series, pd.Series]:
-    clean_train = train_df.copy()
+def load_standardizer(json_path: Path) -> Tuple[pd.Series, pd.Series]:
+    with open(json_path, "r", encoding="utf-8") as f:
+        payload = json.load(f)
 
-    # Replace inf values before computing stats
-    clean_train[feature_cols] = clean_train[feature_cols].replace([np.inf, -np.inf], np.nan)
-
-    mean = clean_train[feature_cols].mean()
-    std = clean_train[feature_cols].std()
-
-    # Prevent divide-by-zero
+    mean = pd.Series(payload["mean"], dtype="float64")
+    std = pd.Series(payload["std"], dtype="float64")
     std = std.replace(0, 1.0)
 
     return mean, std
@@ -74,16 +70,9 @@ def fit_standardizer(train_df: pd.DataFrame, feature_cols: list[str]) -> Tuple[p
 def apply_standardizer(df: pd.DataFrame, feature_cols: list[str], mean: pd.Series, std: pd.Series) -> pd.DataFrame:
     df = df.copy()
 
-    # Replace infs with NaN first
     df[feature_cols] = df[feature_cols].replace([np.inf, -np.inf], np.nan)
-
-    # Fill missing values using train statistics
     df[feature_cols] = df[feature_cols].fillna(mean)
-
-    # Standardize
     df[feature_cols] = (df[feature_cols] - mean) / std
-
-    # Safety pass in case anything weird remains
     df[feature_cols] = df[feature_cols].replace([np.inf, -np.inf], np.nan)
     df[feature_cols] = df[feature_cols].fillna(0.0)
 
@@ -106,7 +95,6 @@ def make_loader(df: pd.DataFrame, feature_cols: list[str], batch_size: int, shuf
 def evaluate(model: nn.Module, loader: DataLoader, device: torch.device) -> Dict[str, float]:
     model.eval()
 
-    all_logits = []
     all_probs = []
     all_preds = []
     all_targets = []
@@ -119,7 +107,6 @@ def evaluate(model: nn.Module, loader: DataLoader, device: torch.device) -> Dict
         probs = torch.sigmoid(logits)
         preds = (logits > 0).long()
 
-        all_logits.append(logits.cpu().numpy())
         all_probs.append(probs.cpu().numpy())
         all_preds.append(preds.cpu().numpy())
         all_targets.append(yb.cpu().numpy())
@@ -127,6 +114,11 @@ def evaluate(model: nn.Module, loader: DataLoader, device: torch.device) -> Dict
     y_true = np.concatenate(all_targets)
     y_pred = np.concatenate(all_preds)
     y_prob = np.concatenate(all_probs)
+
+    valid_mask = np.isfinite(y_true) & np.isfinite(y_pred) & np.isfinite(y_prob)
+    y_true = y_true[valid_mask]
+    y_pred = y_pred[valid_mask]
+    y_prob = y_prob[valid_mask]
 
     metrics = {
         "accuracy": float(accuracy_score(y_true, y_pred)),
@@ -166,86 +158,71 @@ def train_one_epoch(
     return running_loss / total_examples
 
 
-def save_standardizer(mean: pd.Series, std: pd.Series, out_path: Path) -> None:
-    payload = {
-        "mean": mean.to_dict(),
-        "std": std.to_dict(),
-    }
-    with open(out_path, "w", encoding="utf-8") as f:
-        json.dump(payload, f, indent=2)
-        
-def report_bad_values(df: pd.DataFrame, feature_cols: list[str], name: str) -> None:
-    values = df[feature_cols]
-
-    nan_count = values.isna().sum().sum()
-    inf_count = np.isinf(values.to_numpy()).sum()
-
-    print(f"\n{name} bad-value report:")
-    print(f"  NaN count: {nan_count}")
-    print(f"  Inf count: {inf_count}")
-
-    if nan_count > 0:
-        bad_cols = values.isna().sum()
-        bad_cols = bad_cols[bad_cols > 0].sort_values(ascending=False)
-        print("  Columns with NaNs:")
-        print(bad_cols.head(20))
-
 def main() -> None:
     set_seed()
     device = get_device()
-
     repo_root = get_repo_root()
+
     splits_dir = repo_root / "data" / "splits"
-    results_dir = repo_root / "results"
-    models_dir = results_dir / "models"
-    logs_dir = results_dir / "logs"
-    ensure_dir(models_dir)
+    models_dir = repo_root / "results" / "models"
+    logs_dir = repo_root / "results" / "logs"
     ensure_dir(logs_dir)
 
     print(f"Using device: {device}")
 
     # =========================
-    # Load data
+    # Load splits
     # =========================
-    source_train = load_split(splits_dir / "source_train.csv")
-    source_val = load_split(splits_dir / "source_val.csv")
     source_test = load_split(splits_dir / "source_test.csv")
+    target_adapt_train = load_split(splits_dir / "target_adapt_train.csv")
+    target_adapt_val = load_split(splits_dir / "target_adapt_val.csv")
     target_test = load_split(splits_dir / "target_test.csv")
 
-    feature_cols = get_feature_cols(source_train)
+    feature_cols = get_feature_cols(target_adapt_train)
     input_dim = len(feature_cols)
 
     print(f"Number of features: {input_dim}")
 
     # =========================
-    # Fit scaler on source train only
+    # Load source standardizer
     # =========================
-    mean, std = fit_standardizer(source_train, feature_cols)
+    mean, std = load_standardizer(logs_dir / "source_standardizer.json")
 
-    source_train = apply_standardizer(source_train, feature_cols, mean, std)
-    source_val = apply_standardizer(source_val, feature_cols, mean, std)
     source_test = apply_standardizer(source_test, feature_cols, mean, std)
+    target_adapt_train = apply_standardizer(target_adapt_train, feature_cols, mean, std)
+    target_adapt_val = apply_standardizer(target_adapt_val, feature_cols, mean, std)
     target_test = apply_standardizer(target_test, feature_cols, mean, std)
 
-    report_bad_values(source_train, feature_cols, "source_train")
-    report_bad_values(source_val, feature_cols, "source_val")
-    report_bad_values(source_test, feature_cols, "source_test")
-    report_bad_values(target_test, feature_cols, "target_test")
-
-    save_standardizer(mean, std, logs_dir / "source_standardizer.json")
-
     # =========================
-    # DataLoaders
+    # Dataloaders
     # =========================
-    train_loader = make_loader(source_train, feature_cols, BATCH_SIZE, shuffle=True)
-    val_loader = make_loader(source_val, feature_cols, BATCH_SIZE, shuffle=False)
-    source_test_loader = make_loader(source_test, feature_cols, BATCH_SIZE, shuffle=False)
+    adapt_train_loader = make_loader(target_adapt_train, feature_cols, BATCH_SIZE, shuffle=True)
+    adapt_val_loader = make_loader(target_adapt_val, feature_cols, BATCH_SIZE, shuffle=False)
     target_test_loader = make_loader(target_test, feature_cols, BATCH_SIZE, shuffle=False)
+    source_test_loader = make_loader(source_test, feature_cols, BATCH_SIZE, shuffle=False)
 
     # =========================
-    # Model
+    # Load best source model
     # =========================
     model = MLP(input_dim=input_dim).to(device)
+    source_model_path = models_dir / "source_mlp_best.pt"
+    model.load_state_dict(torch.load(source_model_path, map_location=device))
+
+    print("\nBefore adaptation:")
+    pre_source_metrics = evaluate(model, source_test_loader, device)
+    pre_target_metrics = evaluate(model, target_test_loader, device)
+
+    print("Source test metrics:")
+    for k, v in pre_source_metrics.items():
+        print(f"  {k}: {v:.4f}")
+
+    print("Target test metrics (zero-shot):")
+    for k, v in pre_target_metrics.items():
+        print(f"  {k}: {v:.4f}")
+
+    # =========================
+    # Fine-tune on target adaptation set
+    # =========================
     criterion = nn.BCEWithLogitsLoss()
     optimizer = torch.optim.Adam(
         model.parameters(),
@@ -256,16 +233,12 @@ def main() -> None:
     best_val_f1 = -1.0
     best_epoch = -1
     patience_counter = 0
-    best_model_path = models_dir / "source_mlp_best.pt"
-
+    best_model_path = models_dir / "target_adapt_no_replay_best.pt"
     history = []
 
-    # =========================
-    # Train
-    # =========================
     for epoch in range(1, NUM_EPOCHS + 1):
-        train_loss = train_one_epoch(model, train_loader, optimizer, criterion, device)
-        val_metrics = evaluate(model, val_loader, device)
+        train_loss = train_one_epoch(model, adapt_train_loader, optimizer, criterion, device)
+        val_metrics = evaluate(model, adapt_val_loader, device)
 
         row = {
             "epoch": epoch,
@@ -277,10 +250,10 @@ def main() -> None:
         print(
             f"Epoch {epoch:02d} | "
             f"train_loss={train_loss:.4f} | "
-            f"val_f1={val_metrics['f1']:.4f} | "
-            f"val_acc={val_metrics['accuracy']:.4f} | "
-            f"val_recall={val_metrics['recall']:.4f} | "
-            f"val_auc={val_metrics['roc_auc']:.4f}"
+            f"target_val_f1={val_metrics['f1']:.4f} | "
+            f"target_val_acc={val_metrics['accuracy']:.4f} | "
+            f"target_val_recall={val_metrics['recall']:.4f} | "
+            f"target_val_auc={val_metrics['roc_auc']:.4f}"
         )
 
         if val_metrics["f1"] > best_val_f1:
@@ -295,43 +268,49 @@ def main() -> None:
             print(f"Early stopping triggered at epoch {epoch}.")
             break
 
-    print(f"\nBest epoch: {best_epoch}")
-    print(f"Best val F1: {best_val_f1:.4f}")
+    print(f"\nBest adaptation epoch: {best_epoch}")
+    print(f"Best target val F1: {best_val_f1:.4f}")
 
     # =========================
-    # Load best model
+    # Load best adapted model
     # =========================
     model.load_state_dict(torch.load(best_model_path, map_location=device))
 
     # =========================
     # Final evaluation
     # =========================
-    source_metrics = evaluate(model, source_test_loader, device)
-    target_metrics = evaluate(model, target_test_loader, device)
+    post_target_metrics = evaluate(model, target_test_loader, device)
+    post_source_metrics = evaluate(model, source_test_loader, device)
 
-    print("\nSource test metrics:")
-    for k, v in source_metrics.items():
+    print("\nAfter adaptation:")
+    print("Target test metrics:")
+    for k, v in post_target_metrics.items():
         print(f"  {k}: {v:.4f}")
 
-    print("\nTarget test metrics (zero-shot transfer):")
-    for k, v in target_metrics.items():
+    print("Source test metrics:")
+    for k, v in post_source_metrics.items():
         print(f"  {k}: {v:.4f}")
 
+    # =========================
+    # Save logs
+    # =========================
     history_df = pd.DataFrame(history)
-    history_df.to_csv(logs_dir / "source_training_history.csv", index=False)
+    history_df.to_csv(logs_dir / "target_adaptation_no_replay_history.csv", index=False)
 
     metrics_df = pd.DataFrame(
         [
-            {"split": "source_test", **source_metrics},
-            {"split": "target_test_zero_shot", **target_metrics},
+            {"phase": "pre_adapt_source_test", **pre_source_metrics},
+            {"phase": "pre_adapt_target_test_zero_shot", **pre_target_metrics},
+            {"phase": "post_adapt_target_test", **post_target_metrics},
+            {"phase": "post_adapt_source_test", **post_source_metrics},
         ]
     )
-    metrics_df.to_csv(logs_dir / "source_eval_metrics.csv", index=False)
+    metrics_df.to_csv(logs_dir / "target_adaptation_no_replay_metrics.csv", index=False)
 
     print("\nSaved:")
-    print(f"  model: {best_model_path}")
-    print(f"  history: {logs_dir / 'source_training_history.csv'}")
-    print(f"  metrics: {logs_dir / 'source_eval_metrics.csv'}")
+    print(f"  adapted model: {best_model_path}")
+    print(f"  history: {logs_dir / 'target_adaptation_no_replay_history.csv'}")
+    print(f"  metrics: {logs_dir / 'target_adaptation_no_replay_metrics.csv'}")
 
 
 if __name__ == "__main__":
